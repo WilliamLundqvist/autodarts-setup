@@ -54,20 +54,12 @@ board_home() {
   getent passwd "$BOARD_USER" | cut -d: -f6
 }
 
-run_as_board_user() {
-  local cmd=$1
-  local home
-  home="$(board_home)"
-  sudo -u "$BOARD_USER" -H env HOME="$home" USER="$BOARD_USER" LOGNAME="$BOARD_USER" \
-    bash -lc "$cmd"
-}
-
 apt_install_if_missing() {
   local pkgs=("$@")
   local missing=()
   local p
   for p in "${pkgs[@]}"; do
-  if ! dpkg -s "$p" &>/dev/null; then
+    if ! dpkg -s "$p" &>/dev/null; then
       missing+=("$p")
     fi
   done
@@ -168,22 +160,34 @@ install_tailscale() {
     log "Ansluter Tailscale (auth key från TS_AUTHKEY)..."
     tailscale up "${up_args[@]}"
   else
-    log "Ansluter Tailscale — följ login-URL nedan (ingen TS_AUTHKEY satt)"
-    # Intentionally allow this to print the URL to the operator
-    tailscale up "${up_args[@]}" || true
-    warn "Om du inte ser en URL, kör: sudo tailscale up"
+    log "Ingen TS_AUTHKEY — försöker visa login-URL (timeout 25s, blockerar inte resten)"
+    set +e
+    timeout 25s tailscale up "${up_args[@]}" 2>&1 | tee /dev/stderr
+    local ts_rc=${PIPESTATUS[0]}
+    set -e
+    if [[ "$ts_rc" -eq 124 ]]; then
+      warn "Tailscale väntar på inloggning — installationen fortsätter. Kör senare: sudo tailscale up"
+    elif [[ "$ts_rc" -ne 0 ]]; then
+      warn "tailscale up avslutades (kod ${ts_rc}). Logga in manuellt: sudo tailscale up"
+    fi
   fi
 }
 
 install_autodarts_headless() {
-  apt_install_if_missing curl ca-certificates
-  local extra_args=()
+  local home installer beta_arg=()
+  home="$(board_home)"
   if [[ "$AUTODARTS_BETA" == "1" ]]; then
-    extra_args+=(--beta)
+    beta_arg=(--beta)
   fi
   log "Installerar Autodarts headless (officiellt) för användare ${BOARD_USER}"
+  installer="$(mktemp)"
+  curl -fsSL "${AUTODARTS_INSTALL_URL}" -o "$installer"
+  chown "${BOARD_USER}:${BOARD_USER}" "$installer"
+  chmod u+x "$installer"
   # Official installer must run without sudo; re-run is supported.
-  run_as_board_user "curl -fsSL '${AUTODARTS_INSTALL_URL}' | bash -s -- --headless ${extra_args[*]:-}"
+  sudo -u "$BOARD_USER" -H env HOME="$home" USER="$BOARD_USER" LOGNAME="$BOARD_USER" \
+    bash "$installer" -s -- --headless "${beta_arg[@]}"
+  rm -f "$installer"
 }
 
 enable_user_linger() {
@@ -249,6 +253,16 @@ EOF
 }
 
 print_next_steps() {
+  local ts_display ts_login_hint=""
+  if [[ -n "$CUSTOMER" ]]; then
+    ts_display="autodarts-${CUSTOMER}"
+  else
+    ts_display="(Tailscale standardnamn — sätt CUSTOMER för autodarts-<kund>)"
+  fi
+  if [[ -z "$TS_AUTHKEY" ]]; then
+    ts_login_hint="  Ingen TS_AUTHKEY användes — logga in: sudo tailscale up"
+  fi
+
   cat <<EOF
 
 ${LOG_PREFIX} --- Klart (v0.1) ---
@@ -271,7 +285,8 @@ Uppdateringar:
   • Docs: https://autodarts.diy/getting-started/installation/
 
 Tailscale: sudo tailscale status
-  Maskinens namn i Tailscale: ${CUSTOMER:+autodarts-${CUSTOMER}}${CUSTOMER:-(standard)}
+  Förväntat namn i Tailscale (om CUSTOMER satt): ${ts_display}
+${ts_login_hint}
 
 Dokumentation: https://github.com/WilliamLundqvist/autodarts-setup
 
@@ -284,7 +299,7 @@ main() {
   require_pi_arm64
   require_board_user
 
-  apt_install_if_missing sudo ca-certificates
+  apt_install_if_missing curl ca-certificates sudo
 
   configure_hostname
   configure_timezone
